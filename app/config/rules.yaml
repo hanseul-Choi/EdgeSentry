@@ -1,0 +1,20 @@
+risk_thresholds:
+  medium: 40
+  high: 70
+
+rules:
+  ip_high_velocity:
+    enabled: true
+    weight: 35
+    window_seconds: 60
+    threshold: 10
+  account_high_failure:
+    enabled: true
+    weight: 40
+    window_seconds: 60
+    threshold: 5
+  ip_account_fanout:
+    enabled: true
+    weight: 45
+    window_seconds: 60
+    threshold: 5
