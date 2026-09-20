@@ -1,59 +1,86 @@
-# EdgeSentry — Credential Stuffing Detector 기획 문서
+# EdgeSentry — Login Abuse Detector 기획 문서
 
-> 최종 업데이트: 2026-09-18
-> 상태: 초안 (구현 전, 사용자와 논의하며 계속 구체화 예정)
-> 원칙: 처음엔 최소 골격 + 명확한 룰 2~3개로 시작 → 테스트하며 이슈 발견 시 룰/모듈을 점진적으로 보강
+> 최종 업데이트: 2026-09-20
+> 상태: 초안 v2 (범위를 "로그인 시점 abuse"로 한정. 코드 반영 전 사용자 확인 필요)
+> 원칙: 처음엔 최소 골격 + 명확한 룰로 시작 → 테스트하며 이슈 발견 시 룰/모듈을 점진적으로 보강
 
 ---
 
-## 1. 목적
+## 1. 목적과 범위
 
-로그인(인증) 요청이 들어왔을 때, 이것이 **정상 사용자의 로그인 시도**인지 **자동화된/악의적인 credential stuffing 공격**인지 판단해 위험도 스코어와 판단 근거를 반환하는 엔진.
+### 1-1. 목적
+
+**로그인(인증) 시점**에 발생하는 abuse를 탐지한다. 로그인 시도가 정상 사용자의 것인지, 아래 공격 유형에 해당하는지 판단해 위험도 스코어와 판단 근거를 반환하는 엔진.
 
 - 최종 차단/챌린지 여부는 **호출자(로그인 서버 등)가 결정** — 엔진은 판단 재료(스코어, 위험도, 근거)만 제공한다.
 - Python 기반, 독립 HTTP 서비스(FastAPI)로 동작.
 - 룰 기반으로 시작하고, 필요 시 통계적 스코어링 → ML로 단계적으로 발전시킨다.
 
+### 1-2. 탐지 대상 공격 유형
+
+| 공격 유형 | 시그니처 | 대응 룰 |
+|---|---|---|
+| Credential stuffing | 유출된 계정 목록으로 한 IP가 여러 계정에 시도 | `ip_account_fanout` |
+| Brute force | 한 계정에 비밀번호를 바꿔가며 반복 실패 | `account_high_failure`, `ip_high_velocity` |
+| Password spraying | 흔한 비밀번호 하나로 다수 계정을 저속으로 시도 | `ip_account_fanout` (긴 윈도우 설정) |
+| 실패 후 성공 (탈취 의심) | 실패가 누적된 계정이 뒤이어 로그인에 성공 | `success_after_failures` (신규) |
+
+### 1-3. 범위 밖 (이 프로젝트에서 다루지 않음)
+
+- 로그인 이후 세션/행위 기반 탐지 (impossible travel 등 계정 탈취 후 행위 분석)
+- 로그인 외 엔드포인트의 범용 봇 탐지
+- 디바이스 지문, IP reputation(VPN/프록시/데이터센터), GeoIP 기반 탐지
+
+> 위 항목은 로그인 abuse 탐지와 데이터 수집 요건이 달라 범위를 흐리므로 기획에서 제외한다. 필요해지면 별도 기획으로 다룬다.
+
 ---
 
 ## 2. 시스템 개요
 
+로그인 플로우에서 EdgeSentry를 **두 번, 역할을 나눠** 호출한다.
+
 ```
 로그인 서버 / API Gateway
-      │  POST /v1/detect  (로그인 시도 메타데이터)
+      │
+      │ (1) POST /v1/login/check   ← 비밀번호 검증 전, 조회만 (상태 기록 없음)
       ▼
-┌─────────────────────────────┐
-│         EdgeSentry           │
-│                               │
-│  1. 요청 파싱/검증 (schemas)  │
-│  2. 상태 조회 (StateStore)    │  ← IP/계정별 최근 이력
-│  3. 룰 엔진 실행 (rules/*)    │  ← config/rules.yaml 기준
-│  4. 스코어 합산 (scoring)     │
-│  5. 상태 갱신                 │
-└─────────────────────────────┘
-      │  score, risk_level, triggered_rules, reasons
+┌──────────────────────────────┐
+│         EdgeSentry            │
+│  요청 검증 → 상태 조회 → 룰 평가 → 스코어 │
+└──────────────────────────────┘
+      │  score, risk_level, triggered_rules
       ▼
-   호출자가 allow / challenge / block 결정
+로그인 서버: 위험도에 따라 allow / challenge / block
+      │  (차단되지 않은 경우 비밀번호 검증 수행)
+      │
+      │ (2) POST /v1/login/report  ← 인증 결과 확정 후, 기록 + 결과 기반 룰 평가
+      ▼
+┌──────────────────────────────┐
+│         EdgeSentry            │
+│  요청 검증 → 상태 조회 → 룰 평가 → 스코어 → 상태 기록 │
+└──────────────────────────────┘
 ```
 
-- 엔진은 **동기·실시간** 응답을 전제로 한다 (로그인 플로우를 막지 않을 정도의 지연 시간).
+- **check**: 사전 차단용. 이미 HIGH인 IP는 비밀번호 해시 연산(bcrypt 등) 전에 걸러낸다. 상태를 기록하지 않으므로 report와 이중 카운트되지 않는다.
+- **report**: 로그인 결과(`success`/`failure`)를 기록한다. 실패 카운트와 `success_after_failures` 같은 결과 기반 룰은 이 단계에서 평가한다.
+- 엔진은 **동기·실시간** 응답을 전제로 한다 (로그인 플로우를 막지 않을 정도의 지연 시간). 호출 실패 시 fail-open 권장.
 - 판단에 필요한 상태(짧은 시간 내 시도 횟수 등)는 엔진 내부에서 관리한다.
 
 ---
 
 ## 3. 입력 데이터 (요청 스키마)
 
-호출자가 아래 정보를 넘겨준다고 가정한다. 전부 필수는 아니며, 없는 필드는 관련 룰이 스킵되도록 설계한다(가용 데이터가 늘어날수록 자연히 탐지력이 좋아지는 구조).
+룰이 실제로 사용하는 필드만 정의한다.
 
-| 카테고리 | 필드 예시 |
-|---|---|
-| 기본 요청 정보 | `ip`, `user_agent`, `timestamp`, `account_id`(또는 해시), `login_result`(success/fail), `endpoint` |
-| 디바이스/브라우저 지문 | `device_fingerprint_hash`, `header_order_hash`, (가능하면) TLS/JA3 |
-| 세션/이력 | `session_id`, `cookie_id`, 클라이언트가 넘겨주는 과거 로그인 이력 요약(선택) |
-| 지리/네트워크 | `geo_country`, `geo_city`, `asn`, `is_known_proxy_vpn_dc`(IP reputation 플래그) |
+| 필드 | check | report | 용도 |
+|---|:---:|:---:|---|
+| `ip` | 필수 | 필수 | IP 단위 룰의 키 |
+| `account_id` | 권장 | 권장 | 계정 단위 룰의 키 (원문 대신 해시 전달 권장) |
+| `timestamp` | 선택 | 선택 | 미입력 시 서버 UTC 현재 시각 |
+| `login_result` | — | 필수 | `success` / `failure` |
 
-> ⚠️ 열린 질문: 디바이스 지문은 클라이언트(브라우저)에서 별도 JS로 수집해야 넘겨줄 수 있음. 현재 그런 수집 파이프라인이 있는지 확인 필요 → 없다면 1단계에서는 device fingerprint 관련 룰은 제외하고 시작.
-> ⚠️ 열린 질문: GeoIP/IP reputation 데이터 소스(MaxMind, 자체 DB, 외부 API 등) 미정 → 1단계에서는 이 필드가 없을 때를 기본값으로 가정.
+- 없는 필드는 관련 룰이 스킵된다 (예: `account_id`가 없으면 계정 단위 룰은 평가하지 않음).
+- `user_agent`는 현재 룰이 사용하지 않으므로 선택 필드로만 두고, 룰 추가 시 그때 사용 여부를 정한다.
 
 ---
 
@@ -78,26 +105,27 @@
 
 - 룰은 **YAML 설정 파일**(`config/rules.yaml`)로 정의: 임계값, 가중치를 코드 수정 없이 조정 가능.
 - 각 룰은 독립 모듈로 구현하고, 룰 엔진이 순회하며 실행 → 트리거된 룰의 가중치를 합산해 스코어 산출.
+- 각 룰은 자신이 평가되는 단계(`check` / `report` / 둘 다)를 선언한다.
 - 상태 저장소는 `StateStore` 인터페이스로 추상화 (1단계: in-memory 구현체 / 이후: Redis 등으로 교체 가능하도록).
 
-### 5-1. 1단계 스타터 룰 후보 (가장 신호가 명확한 것부터)
+### 5-1. 룰 목록
 
-| 룰 ID | 설명 | 필요 데이터 |
+| 룰 ID | 설명 | 평가 단계 | 필요 데이터 | 상태 |
+|---|---|---|---|---|
+| `ip_high_velocity` | 짧은 시간 내 동일 IP에서 비정상적으로 많은 로그인 시도 | check, report | ip | 구현됨 |
+| `account_high_failure` | 짧은 시간 내 동일 계정에 대한 로그인 실패 반복 | check, report | account_id, login_result | 구현됨 |
+| `ip_account_fanout` | 동일 IP가 짧은 시간 내 다수의 서로 다른 계정으로 시도 | check, report | ip, account_id | 구현됨 |
+| `success_after_failures` | 실패가 N회 이상 누적된 계정에 로그인 성공 (IP 무관) | report | account_id, login_result | **신규** |
+
+### 5-2. 이후 보강 후보 (로그인 abuse 범위 내)
+
+| 룰 ID | 설명 | 비고 |
 |---|---|---|
-| `ip_high_velocity` | 짧은 시간(예: 60s) 내 동일 IP에서 비정상적으로 많은 로그인 시도 | ip, timestamp |
-| `account_high_failure` | 짧은 시간 내 동일 계정에 대한 로그인 실패가 반복 | account_id, login_result, timestamp |
-| `ip_account_fanout` | 동일 IP가 짧은 시간 내 서로 다른 다수 계정으로 로그인 시도 (스프레이 공격 시그니처) | ip, account_id, timestamp |
+| `account_distributed_failure` | 여러 IP에서 한 계정으로 분산된 실패 | 분산 brute force 대응 |
+| `ip_high_failure_ratio` | IP 단위 로그인 실패율이 비정상적으로 높음 | 성공률이 낮은 stuffing 대응 |
+| `spray_long_window` | 긴 윈도우(예: 1시간)에서 저속 fanout | password spraying 대응. `ip_account_fanout`에 윈도우를 추가하는 방식도 가능 |
 
-### 5-2. 2단계 이후 보강 후보
-
-| 룰 ID | 설명 | 필요 데이터 |
-|---|---|---|
-| `known_proxy_vpn_dc` | 알려진 프록시/VPN/데이터센터 IP에서의 시도 | is_known_proxy_vpn_dc |
-| `impossible_travel` | 짧은 시간 내 물리적으로 불가능한 국가 간 이동 | geo_country, account_id, timestamp |
-| `device_fingerprint_anomaly` | 동일 계정에 비정상적으로 많은 디바이스 지문이 붙거나, 자동화 툴 시그니처 UA | device_fingerprint_hash, user_agent |
-| `mechanical_timing` | 요청 간격의 variance가 비정상적으로 낮음(스크립트성 패턴) | timestamp 시계열 |
-
-> 구현은 1단계 룰부터: 골격을 만들고 테스트 시나리오(정상 사용자 vs 공격 시나리오)로 검증한 뒤, 이슈가 보이는 지점 위주로 2단계 룰을 하나씩 추가한다.
+> 구현은 1단계 룰부터: 골격을 만들고 테스트 시나리오(정상 사용자 vs 공격 시나리오)로 검증한 뒤, 이슈가 보이는 지점 위주로 후보 룰을 하나씩 추가한다.
 
 ---
 
@@ -107,13 +135,14 @@
 EdgeSentry/
 ├── PLAN.md
 ├── app/
-│   ├── api/            # FastAPI 라우터 (POST /v1/detect 등)
+│   ├── api/            # FastAPI 라우터 (POST /v1/login/check, /v1/login/report)
 │   ├── core/
-│   │   ├── rules_engine.py   # 룰 실행/스코어 합산
+│   │   ├── rules_engine.py   # 룰 실행/스코어 합산 (check/report 모드 지원)
 │   │   ├── rules/             # 룰 1개 = 파일 1개
 │   │   │   ├── ip_high_velocity.py
 │   │   │   ├── account_high_failure.py
-│   │   │   └── ip_account_fanout.py
+│   │   │   ├── ip_account_fanout.py
+│   │   │   └── success_after_failures.py
 │   │   └── state/
 │   │       ├── base.py        # StateStore 인터페이스
 │   │       └── memory_store.py
@@ -131,18 +160,26 @@ EdgeSentry/
 
 ## 7. 개발·검증 전략 (반복 보강)
 
-1. **1단계**: 스키마 + `rules_engine` 골격 + 스타터 룰 3개 + in-memory `StateStore`
-2. **테스트**: pytest로 룰별 단위 테스트 + 시나리오 테스트(정상 사용자 트래픽 fixture, credential stuffing 공격 fixture)를 먼저 작성해 룰이 의도대로 동작하는지 검증
-3. **린트/타입체크**: ruff + mypy (제안 — 확정 필요)
-4. **2단계**: 테스트하며 발견한 놓친 패턴/오탐 이슈를 기준으로 룰 보강 (5-2 후보군에서 우선순위 결정)
+1. **1단계**: check/report API 분리 + 룰 엔진 모드 지원 + `success_after_failures` 추가
+2. **테스트**: pytest로 룰별 단위 테스트 + 시나리오 테스트(정상 사용자, stuffing, brute force, spraying, 실패 후 성공)를 먼저 작성해 검증
+3. **린트/타입체크**: ruff + mypy (이미 프로젝트에 적용됨)
+4. **2단계**: 테스트하며 발견한 놓친 패턴/오탐 이슈를 기준으로 5-2 후보 룰 보강
 5. **이후**: 상태 저장소를 Redis 등으로 교체(인터페이스는 유지), 필요 시 통계적 스코어링/ML 단계로 확장
 
 ---
 
-## 8. 열린 질문 (구현 전 확정 필요)
+## 8. 열린 질문
 
-- [ ] 디바이스 지문 수집 파이프라인 존재 여부 (없으면 1단계에서 제외)
-- [ ] GeoIP/IP reputation 데이터 소스
-- [ ] 린트/타입체크 도구 확정 (ruff/mypy 제안)
-- [ ] `risk_level` 임계값 초기값 (score → LOW/MEDIUM/HIGH 매핑)
-- [ ] 1단계 스타터 룰 3개의 구체적 임계값(예: "60초 내 몇 회부터 high velocity로 볼지")
+- [ ] `success_after_failures`의 초기 임계값 (예: 10분 윈도우 내 실패 N회 이상 후 성공)
+- [ ] password spraying 대응: 기존 `ip_account_fanout`에 긴 윈도우를 추가할지, 별도 룰로 분리할지
+- [ ] 기존 `POST /v1/detect`를 유지할지(하위 호환), `check`/`report`로 완전히 교체할지
+- [ ] `check` 단계에서 "현재 시도"를 카운트에 포함할지 (report와 임계값 기준을 어떻게 맞출지)
+- [ ] `risk_level` 임계값 초기값 (현재 medium 40 / high 70)
+- [ ] 스키마에서 룰이 사용하지 않는 필드(`device_fingerprint_hash`, `header_order_hash`, `cookie_id`, `geo_*`, `asn`, `is_known_proxy_vpn_dc`, `session_id`)를 코드에서 제거할지
+
+---
+
+## 9. 변경 이력
+
+- 2026-09-20 (v2): 범위를 로그인 abuse로 한정. 공격 유형 4종 정의, 범위 밖 항목(impossible_travel, mechanical_timing, device_fingerprint, IP reputation/GeoIP) 삭제, check/report 분리 호출 방식 도입, `success_after_failures` 룰 추가.
+- 2026-09-18 (v1): 초기 기획 (credential stuffing 탐지).
