@@ -18,3 +18,8 @@ rules:
     weight: 45
     window_seconds: 60
     threshold: 5
+  success_after_failures:
+    enabled: true
+    weight: 50
+    window_seconds: 600
+    threshold: 3

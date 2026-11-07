@@ -9,9 +9,15 @@ from app.schemas.detection import DetectRequest, TriggeredRule
 class BaseRule(ABC):
     """Base class for detection rules."""
 
+    phases: set[str] = {"check", "report"}
+
     def __init__(self, rule_id: str, config: Optional[RuleConfig] = None):
         self.rule_id = rule_id
         self.config = config or RuleConfig()
+
+    def is_applicable(self, phase: str) -> bool:
+        """Check if this rule is applicable in the given evaluation phase ('check' or 'report')."""
+        return phase in self.phases
 
     @property
     def enabled(self) -> bool:
@@ -31,7 +37,7 @@ class BaseRule(ABC):
 
     @abstractmethod
     async def evaluate(
-        self, request: DetectRequest, state: StateStore
+        self, request: DetectRequest, state: StateStore, phase: str = "report"
     ) -> Optional[TriggeredRule]:
         """Evaluate the incoming request against past state.
 

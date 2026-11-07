@@ -22,6 +22,9 @@ def test_settings() -> Settings:
             "ip_account_fanout": RuleConfig(
                 enabled=True, weight=45, window_seconds=60, threshold=5
             ),
+            "success_after_failures": RuleConfig(
+                enabled=True, weight=50, window_seconds=600, threshold=3
+            ),
         },
     )
 

@@ -6,9 +6,17 @@ from app.core.rules.account_high_failure import AccountHighFailureRule
 from app.core.rules.base import BaseRule
 from app.core.rules.ip_account_fanout import IpAccountFanoutRule
 from app.core.rules.ip_high_velocity import IpHighVelocityRule
+from app.core.rules.success_after_failures import SuccessAfterFailuresRule
 from app.core.state.base import StateStore
 from app.core.state.memory_store import MemoryStateStore
-from app.schemas.detection import DetectRequest, DetectResponse, RiskLevel, TriggeredRule
+from app.schemas.detection import (
+    DetectRequest,
+    DetectResponse,
+    LoginCheckRequest,
+    LoginReportRequest,
+    RiskLevel,
+    TriggeredRule,
+)
 
 
 class RulesEngine:
@@ -30,6 +38,7 @@ class RulesEngine:
             "ip_high_velocity": IpHighVelocityRule,
             "account_high_failure": AccountHighFailureRule,
             "ip_account_fanout": IpAccountFanoutRule,
+            "success_after_failures": SuccessAfterFailuresRule,
         }
 
         for rule_id, factory in rule_factories.items():
@@ -48,22 +57,18 @@ class RulesEngine:
             return RiskLevel.MEDIUM
         return RiskLevel.LOW
 
-    async def evaluate(self, request: DetectRequest) -> DetectResponse:
-        """Evaluate an incoming authentication attempt.
-
-        Flow:
-        1. Query StateStore and execute all enabled rules.
-        2. Collect triggered rules and aggregate score (clamped between 0 and 100).
-        3. Determine risk level.
-        4. Record attempt into StateStore to maintain historical context.
-        5. Return DetectResponse.
-        """
+    async def _evaluate_internal(
+        self,
+        request: DetectRequest,
+        phase: str,
+        record_state: bool,
+    ) -> DetectResponse:
         triggered_rules: List[TriggeredRule] = []
 
-        # 1. Execute rules
+        # 1. Execute rules applicable to this phase
         for rule in self.rules.values():
-            if rule.enabled:
-                result = await rule.evaluate(request, self.state_store)
+            if rule.enabled and rule.is_applicable(phase):
+                result = await rule.evaluate(request, self.state_store, phase=phase)
                 if result is not None:
                     triggered_rules.append(result)
 
@@ -74,8 +79,9 @@ class RulesEngine:
         # 3. Categorize risk
         risk_level = self.calculate_risk_level(score)
 
-        # 4. State update
-        await self.state_store.record_attempt(request)
+        # 4. State update (only if requested, e.g., in report phase)
+        if record_state:
+            await self.state_store.record_attempt(request)
 
         # 5. Return response
         return DetectResponse(
@@ -83,4 +89,30 @@ class RulesEngine:
             risk_level=risk_level,
             triggered_rules=triggered_rules,
             evaluated_at=datetime.now(timezone.utc),
+        )
+
+    async def evaluate_check(self, request: LoginCheckRequest) -> DetectResponse:
+        """Pre-auth evaluation: evaluates check-applicable rules without updating state."""
+        return await self._evaluate_internal(
+            request=request.to_detect_request(),
+            phase="check",
+            record_state=False,
+        )
+
+    async def evaluate_report(self, request: LoginReportRequest) -> DetectResponse:
+        """Post-auth evaluation: evaluates report-applicable rules and records attempt in state."""
+        return await self._evaluate_internal(
+            request=request.to_detect_request(),
+            phase="report",
+            record_state=True,
+        )
+
+    async def evaluate(self, request: DetectRequest) -> DetectResponse:
+        """Legacy evaluate method: evaluates report phase and records attempt
+        (backward compatibility).
+        """
+        return await self._evaluate_internal(
+            request=request,
+            phase="report",
+            record_state=True,
         )

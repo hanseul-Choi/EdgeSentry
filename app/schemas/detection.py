@@ -26,6 +26,21 @@ class RiskLevel(str, Enum):
     HIGH = "HIGH"
 
 
+def parse_timezone_aware_timestamp(v: object) -> datetime:
+    if v is None:
+        return datetime.now(timezone.utc)
+    if isinstance(v, str):
+        dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    if isinstance(v, datetime):
+        if v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
+    return v  # type: ignore[return-value]
+
+
 class DetectRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -74,18 +89,71 @@ class DetectRequest(BaseModel):
     @field_validator("timestamp", mode="before")
     @classmethod
     def ensure_timezone_aware(cls, v):
-        if v is None:
-            return datetime.now(timezone.utc)
-        if isinstance(v, str):
-            dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        if isinstance(v, datetime):
-            if v.tzinfo is None:
-                return v.replace(tzinfo=timezone.utc)
-            return v
-        return v
+        return parse_timezone_aware_timestamp(v)
+
+
+class LoginCheckRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    ip: str = Field(..., description="Client IP address", examples=["192.168.1.100"])
+    account_id: Optional[str] = Field(
+        default=None,
+        description="Target account identifier or its hash",
+        examples=["user@example.com"],
+    )
+    timestamp: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="ISO8601 timestamp of the check request (defaults to current UTC time)",
+    )
+    user_agent: Optional[str] = Field(default=None, description="HTTP User-Agent header")
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def ensure_timezone_aware(cls, v):
+        return parse_timezone_aware_timestamp(v)
+
+    def to_detect_request(self) -> DetectRequest:
+        return DetectRequest(
+            ip=self.ip,
+            account_id=self.account_id,
+            timestamp=self.timestamp,
+            user_agent=self.user_agent,
+            login_result=None,
+        )
+
+
+class LoginReportRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    ip: str = Field(..., description="Client IP address", examples=["192.168.1.100"])
+    login_result: LoginResult = Field(
+        ...,
+        description="Outcome of authentication attempt (success or failure)",
+    )
+    account_id: Optional[str] = Field(
+        default=None,
+        description="Target account identifier or its hash",
+        examples=["user@example.com"],
+    )
+    timestamp: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description="ISO8601 timestamp of the authentication report (defaults to current UTC time)",
+    )
+    user_agent: Optional[str] = Field(default=None, description="HTTP User-Agent header")
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def ensure_timezone_aware(cls, v):
+        return parse_timezone_aware_timestamp(v)
+
+    def to_detect_request(self) -> DetectRequest:
+        return DetectRequest(
+            ip=self.ip,
+            account_id=self.account_id,
+            timestamp=self.timestamp,
+            user_agent=self.user_agent,
+            login_result=self.login_result,
+        )
 
 
 class TriggeredRule(BaseModel):

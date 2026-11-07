@@ -1,6 +1,8 @@
 from app.schemas.detection import (
     DetectRequest,
     DetectResponse,
+    LoginCheckRequest,
+    LoginReportRequest,
     LoginResult,
     RiskLevel,
     TriggeredRule,
@@ -9,6 +11,8 @@ from app.schemas.detection import (
 __all__ = [
     "DetectRequest",
     "DetectResponse",
+    "LoginCheckRequest",
+    "LoginReportRequest",
     "LoginResult",
     "RiskLevel",
     "TriggeredRule",

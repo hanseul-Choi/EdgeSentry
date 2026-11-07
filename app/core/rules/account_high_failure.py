@@ -13,7 +13,7 @@ class AccountHighFailureRule(BaseRule):
         super().__init__(rule_id="account_high_failure", config=config)
 
     async def evaluate(
-        self, request: DetectRequest, state: StateStore
+        self, request: DetectRequest, state: StateStore, phase: str = "report"
     ) -> Optional[TriggeredRule]:
         if not self.enabled:
             return None
@@ -28,8 +28,11 @@ class AccountHighFailureRule(BaseRule):
             reference_time=request.timestamp,
         )
 
-        is_current_failure = request.login_result == LoginResult.FAILURE
-        total_failures = prev_failures + (1 if is_current_failure else 0)
+        if phase == "check":
+            total_failures = prev_failures
+        else:
+            is_current_failure = request.login_result == LoginResult.FAILURE
+            total_failures = prev_failures + (1 if is_current_failure else 0)
 
         if total_failures >= self.threshold:
             return TriggeredRule(

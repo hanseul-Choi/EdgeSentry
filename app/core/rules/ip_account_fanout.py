@@ -15,7 +15,7 @@ class IpAccountFanoutRule(BaseRule):
         super().__init__(rule_id="ip_account_fanout", config=config)
 
     async def evaluate(
-        self, request: DetectRequest, state: StateStore
+        self, request: DetectRequest, state: StateStore, phase: str = "report"
     ) -> Optional[TriggeredRule]:
         if not self.enabled:
             return None

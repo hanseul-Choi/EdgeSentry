@@ -1,7 +1,12 @@
 from fastapi import APIRouter, Depends
 
 from app.core.rules_engine import RulesEngine
-from app.schemas.detection import DetectRequest, DetectResponse
+from app.schemas.detection import (
+    DetectRequest,
+    DetectResponse,
+    LoginCheckRequest,
+    LoginReportRequest,
+)
 
 router = APIRouter(tags=["Detection"])
 
@@ -21,7 +26,38 @@ def set_rules_engine(engine: RulesEngine) -> None:
     _engine_instance = engine
 
 
-@router.post("/detect", response_model=DetectResponse, summary="Evaluate authentication attempt")
+@router.post(
+    "/login/check",
+    response_model=DetectResponse,
+    summary="Pre-auth check: evaluate risk before password verification",
+)
+async def login_check(
+    request: LoginCheckRequest,
+    engine: RulesEngine = Depends(get_rules_engine),
+) -> DetectResponse:
+    """Evaluate authentication risk prior to credential verification without persisting state."""
+    return await engine.evaluate_check(request)
+
+
+@router.post(
+    "/login/report",
+    response_model=DetectResponse,
+    summary="Post-auth report: record outcome and evaluate result-based rules",
+)
+async def login_report(
+    request: LoginReportRequest,
+    engine: RulesEngine = Depends(get_rules_engine),
+) -> DetectResponse:
+    """Record authentication outcome and evaluate post-auth rules (e.g. success_after_failures)."""
+    return await engine.evaluate_report(request)
+
+
+@router.post(
+    "/detect",
+    response_model=DetectResponse,
+    summary="Evaluate authentication attempt (legacy / backward compatibility)",
+    deprecated=True,
+)
 async def detect_attempt(
     request: DetectRequest,
     engine: RulesEngine = Depends(get_rules_engine),
